@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional
-from replit import db
+
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
@@ -15,10 +15,53 @@ from PIL import Image
 import io
 import json
 
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Table, MetaData
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.exc import NoResultFound
+
 # Constants
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# SQLite database setup
+DATABASE_URL = "sqlite:///./flytip.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Define User table
+class UserInDB(Base):
+    __tablename__ = "users"
+    username = Column(String, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    country = Column(String, nullable=True)
+    postcode = Column(String, nullable=True)
+    communities = Column(Text, nullable=True)  # Store as JSON string
+
+# Define FlyTippingReport table
+class FlyTippingReport(Base):
+    __tablename__ = "reports"
+    id = Column(String, primary_key=True, index=True)
+    user = Column(String, index=True)
+    location = Column(String)
+    coordinates = Column(String)
+    materials = Column(Text)  # Store as JSON string
+    notes = Column(Text, nullable=True)
+    timestamp = Column(DateTime)
+    photos = Column(Text)  # Store as JSON string
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# Dependency to get the database session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 app = FastAPI()
 
@@ -39,9 +82,6 @@ class User(BaseModel):
     postcode: Optional[str] = None
     communities: List[str] = []
 
-class UserInDB(User):
-    hashed_password: str
-
 class FlyTippingReportRequest(BaseModel):
     location: str
     coordinates: str
@@ -49,7 +89,7 @@ class FlyTippingReportRequest(BaseModel):
     notes: Optional[str] = None
     photos: List[str]
 
-class FlyTippingReport(BaseModel):
+class FlyTippingReportResponse(BaseModel):
     id: str
     user: str
     location: str
@@ -82,7 +122,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -96,22 +136,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user_dict = db.get(token_data.username)
-    if user_dict is None:
+    user = db.query(UserInDB).filter(UserInDB.username == token_data.username).first()
+    if user is None:
         raise credentials_exception
-    return UserInDB(**user_dict)
+    return user
 
 @app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user_dict = db.get(form_data.username)
-    if not user_dict:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    user = UserInDB(**user_dict)
-    if not verify_password(form_data.password, user.hashed_password):
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLocal = Depends(get_db)):
+    user = db.query(UserInDB).filter(UserInDB.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -124,24 +157,34 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/users/", response_model=User)
-async def create_user(user: User):
-    if db.get(user.username):
+async def create_user(user: User, db: SessionLocal = Depends(get_db)):
+    existing_user = db.query(UserInDB).filter(UserInDB.username == user.username).first()
+    if existing_user:
         raise HTTPException(status_code=400, detail="Username already registered")
     hashed_password = get_password_hash(user.hashed_password)
-    user_data = user.dict()
-    user_data['hashed_password'] = hashed_password
-    db[user.username] = user_data
-    return user
+    db_user = UserInDB(
+        username=user.username,
+        email=user.email,
+        hashed_password=hashed_password,
+        country=user.country,
+        postcode=user.postcode,
+        communities=json.dumps(user.communities),
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
 @app.get("/users/me/", response_model=User)
-async def read_users_me(current_user: User = Depends(get_current_user)):
+async def read_users_me(current_user: UserInDB = Depends(get_current_user)):
     return current_user
 
 @app.put("/users/me/", response_model=User)
-async def update_user_me(user: User, current_user: User = Depends(get_current_user)):
+async def update_user_me(user: User, current_user: UserInDB = Depends(get_current_user), db: SessionLocal = Depends(get_db)):
     current_user_data = current_user.dict()
     current_user_data.update(user.dict(exclude_unset=True))
-    db[current_user.username] = current_user_data
+    db.query(UserInDB).filter(UserInDB.username == current_user.username).update(current_user_data)
+    db.commit()
     return User(**current_user_data)
 
 @app.post("/upload-photo/")
@@ -178,55 +221,46 @@ async def upload_photo(report_id: str = Form(...), file: UploadFile = File(...))
     return {"file_url": f"/static/tip_pictures/{filename}"}
 
 
-@app.post("/reports/", response_model=FlyTippingReport)
-async def create_report(report: FlyTippingReportRequest, current_user: User = Depends(get_current_user)):
+@app.post("/reports/", response_model=FlyTippingReportResponse)
+async def create_report(report: FlyTippingReportRequest, current_user: UserInDB = Depends(get_current_user), db: SessionLocal = Depends(get_db)):
     new_report = FlyTippingReport(
         id=f"report_{str(uuid4())}",
         user=current_user.username,
         location=report.location,
         coordinates=report.coordinates,
-        materials=report.materials,
+        materials=json.dumps(report.materials),
         notes=report.notes,
         timestamp=datetime.utcnow(),
-        photos=report.photos
+        photos=json.dumps(report.photos),
     )
-    db[new_report.id] = json.loads(new_report.json())
+    db.add(new_report)
+    db.commit()
+    db.refresh(new_report)
     return new_report
 
-@app.get("/reports/", response_model=List[FlyTippingReport])
-async def get_reports(current_user: User = Depends(get_current_user)):
-    reports = []
-    for key in db.prefix('report_'):
-        report_data = db[key]
-        report = FlyTippingReport(**report_data)
-        if report.user == current_user.username:
-            reports.append(report)
+@app.get("/reports/", response_model=List[FlyTippingReportResponse])
+async def get_reports(current_user: UserInDB = Depends(get_current_user), db: SessionLocal = Depends(get_db)):
+    reports = db.query(FlyTippingReport).filter(FlyTippingReport.user == current_user.username).all()
     return reports
 
-@app.get("/reports/{report_id}", response_model=FlyTippingReport)
-async def get_report(report_id: str, current_user: User = Depends(get_current_user)):
-    report_data = db.get(report_id)
-    if not report_data:
-        raise HTTPException(status_code=404, detail="Report not found")
-    report = FlyTippingReport(**report_data)
-    if report.user != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to view this report")
+@app.get("/reports/{report_id}", response_model=FlyTippingReportResponse)
+async def get_report(report_id: str, current_user: UserInDB = Depends(get_current_user), db: SessionLocal = Depends(get_db)):
+    report = db.query(FlyTippingReport).filter(FlyTippingReport.id == report_id).first()
+    if not report or report.user != current_user.username:
+        raise HTTPException(status_code=404, detail="Report not found or not authorized")
     return report
 
-@app.put("/reports/{report_id}", response_model=FlyTippingReport)
-async def update_report(report_id: str, updated_report: FlyTippingReportRequest, current_user: User = Depends(get_current_user)):
-    report_data = db.get(report_id)
-    if not report_data:
-        raise HTTPException(status_code=404, detail="Report not found")
-    report = FlyTippingReport(**report_data)
-    if report.user != current_user.username:
-        raise HTTPException(status_code=403, detail="Not authorized to update this report")
+@app.put("/reports/{report_id}", response_model=FlyTippingReportResponse)
+async def update_report(report_id: str, updated_report: FlyTippingReportRequest, current_user: UserInDB = Depends(get_current_user), db: SessionLocal = Depends(get_db)):
+    report = db.query(FlyTippingReport).filter(FlyTippingReport.id == report_id).first()
+    if not report or report.user != current_user.username:
+        raise HTTPException(status_code=404, detail="Report not found or not authorized")
     report.location = updated_report.location
     report.coordinates = updated_report.coordinates
-    report.materials = updated_report.materials
+    report.materials = json.dumps(updated_report.materials)
     report.notes = updated_report.notes
-    report.photos = updated_report.photos
-    db[report.id] = json.loads(report.json())
+    report.photos = json.dumps(updated_report.photos)
+    db.commit()
     return report
 
 @app.get("/static/tip_pictures/{filename}")
